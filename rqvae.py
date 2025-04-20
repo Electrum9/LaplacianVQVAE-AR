@@ -169,11 +169,11 @@ def build_laplacian_pyramid(image, num_levels=3):
     Returns:
         List of pyramid levels (tensors)
     """
-    print(f"Building Laplacian pyramid with {num_levels} levels")
+    #print(f"Building Laplacian pyramid with {num_levels} levels")
     pyramids = []
     current = image
     
-    for i in tqdm(range(num_levels)):
+    for i in range(num_levels):
         # Downsample
         downsampled = F.interpolate(current, scale_factor=0.5, mode='bilinear', align_corners=False)
         
@@ -278,6 +278,82 @@ class SpatialTransformer(nn.Module):
         
         return output
 
+class StandardTransformer(nn.Module):
+    """
+    Standard Transformer model for image generation using VQ-VAE tokens
+    """
+    def __init__(self, d_model=512, nhead=8, num_layers=6, 
+                 dim_feedforward=2048, dropout=0.1, 
+                 code_embedding_dim=64, num_embeddings=1024, max_len=1000):
+        super(StandardTransformer, self).__init__()
+        
+        # Embedding layer for discrete codes
+        self.code_embedding = nn.Embedding(num_embeddings, d_model)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, max_len)
+        
+        # Transformer layers
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, 
+            dim_feedforward=dim_feedforward, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        
+        # Output projection to vocabulary
+        self.output_projection = nn.Linear(d_model, num_embeddings)
+        
+        # Model parameters
+        self.d_model = d_model
+        self.num_embeddings = num_embeddings
+        
+    def forward(self, src, target_indices=None, generation=False):
+        """
+        Forward pass through the transformer
+        
+        Args:
+            src: Source tokens [batch, seq_len]
+            target_indices: Target tokens for training [batch, seq_len] or None for inference
+            generation: Whether we're in generation mode
+        
+        Returns:
+            If generation=False: logits for next token prediction [batch, seq_len, vocab_size]
+            If generation=True: predicted next token [batch, 1]
+        """
+        batch_size = src.shape[0]
+        
+        # Get embeddings
+        src_embeddings = self.code_embedding(src)
+        
+        # Add positional encoding
+        src_embeddings = self.pos_encoder(src_embeddings)
+        
+        # Create causal mask for autoregressive generation
+        seq_len = src.shape[1]
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=src.device) * float('-inf'),
+            diagonal=1
+        )
+        
+        # Prepare for transformer: [seq_len, batch, d_model]
+        src_embeddings = src_embeddings.transpose(0, 1)
+        
+        # Pass through transformer
+        output = self.transformer_encoder(src_embeddings, mask=causal_mask)
+        
+        # Transpose back: [batch, seq_len, d_model]
+        output = output.transpose(0, 1)
+        
+        # Project to vocabulary size
+        logits = self.output_projection(output)
+        
+        if generation:
+            # Return prediction for last position only (for autoregressive generation)
+            next_token = torch.argmax(logits[:, -1:, :], dim=-1)
+            return next_token
+        else:
+            # Return logits for all positions
+            return logits
+    
 
 class DepthTransformer(nn.Module):
     """
@@ -488,10 +564,11 @@ def train_laplacian_vqvae(model, dataloader, optimizer, epochs=10, device='cuda'
     model.to(device)
     model.train()
     print("Training Laplacian VQ-VAE...")
-    for epoch in tqdm(range(epochs)):
+    for epoch in range(epochs):
         total_loss = 0
-        
-        for batch_idx, (data, _) in enumerate(dataloader):  # Unpack properly - datasets return (data, label)
+        loop = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+
+        for batch_idx, (data, _) in enumerate(loop):   # Unpack properly - datasets return (data, label)
             data = data.to(device)
             
             # Build Laplacian pyramid
@@ -514,6 +591,8 @@ def train_laplacian_vqvae(model, dataloader, optimizer, epochs=10, device='cuda'
             optimizer.step()
             
             total_loss += loss.item()
+
+            loop.set_postfix(loss=loss.item())
             
             if batch_idx % 100 == 0:
                 print(f'Epoch: {epoch}, Batch: {batch_idx}, Loss: {loss.item():.4f}')
@@ -522,6 +601,70 @@ def train_laplacian_vqvae(model, dataloader, optimizer, epochs=10, device='cuda'
         
     return model
 
+def train_standard_transformer(model, vqvae_model, dataloader, optimizer, epochs=10, device='cuda'):
+    """
+    Train the standard transformer model
+    """
+    model.to(device)
+    vqvae_model.to(device)
+    model.train()
+    vqvae_model.eval()  # Freeze VQ-VAE
+    
+    criterion = nn.CrossEntropyLoss()
+    
+    for epoch in tqdm(range(epochs)):
+        total_loss = 0
+        
+        for batch_idx, data in enumerate(dataloader):
+            data = data.to(device)
+            batch_size = data.shape[0]
+            
+            # Get tokenized representation from VQ-VAE
+            with torch.no_grad():
+                laplacian_levels = build_laplacian_pyramid(data, num_levels=vqvae_model.num_levels-1)
+                _, _, all_indices, _ = vqvae_model(laplacian_levels, training=False)
+            
+            # Flatten and combine indices for all levels and depths
+            # For simplicity, we'll concatenate all tokens into a single sequence
+            flattened_tokens = []
+            for level_indices in all_indices:
+                for depth_indices in level_indices:
+                    # Flatten spatial dimensions
+                    flat_tokens = depth_indices.reshape(batch_size, -1)
+                    flattened_tokens.append(flat_tokens)
+            
+            # Concatenate all tokens into one sequence per batch
+            # Shape: [batch_size, seq_len]
+            token_sequences = torch.cat(flattened_tokens, dim=1)
+            
+            # Create input and target sequences for next-token prediction
+            # Input: tokens[:-1], Target: tokens[1:]
+            src_tokens = token_sequences[:, :-1]
+            tgt_tokens = token_sequences[:, 1:]
+            
+            # Forward pass
+            logits = model(src_tokens, tgt_tokens)
+            
+            # Compute loss
+            # Reshape for cross entropy: [batch_size * seq_len, vocab_size]
+            logits_flat = logits.reshape(-1, model.num_embeddings)
+            targets_flat = tgt_tokens.reshape(-1)
+            
+            loss = criterion(logits_flat, targets_flat)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            if batch_idx % 50 == 0:
+                print(f'Epoch: {epoch}, Batch: {batch_idx}, Loss: {loss.item():.4f}')
+        
+        print(f'Epoch: {epoch}, Average Loss: {total_loss/len(dataloader):.4f}')
+        
+    return model
 
 # Training function for RQ Transformer
 def train_rq_transformer(model, vqvae_model, dataloader, optimizer, epochs=10, device='cuda'):
@@ -671,6 +814,89 @@ def generate_images(rq_transformer, vqvae_model, num_images=1, device='cuda'):
         images = reconstruct_from_laplacian_pyramid(reconstructed_levels)
         
         return images
+    
+def generate_images_with_standard_transformer(transformer, vqvae_model, num_images=1, device='cuda'):
+    """
+    Generate images using the standard transformer and VQ-VAE
+    """
+    transformer.eval()
+    vqvae_model.eval()
+    
+    with torch.no_grad():
+        batch_size = num_images
+        
+        # Calculate sequence length from VQ-VAE architecture
+        # This is the total number of tokens needed for a complete image
+        # Assuming all levels and depths are concatenated
+        token_len_per_level = []
+        for level in range(vqvae_model.num_levels):
+            # Estimate spatial dimensions after encoding
+            # This is a simplified calculation and may need adjustment
+            h = w = 256 // (2**(level+2))  # Assuming 256x256 input and downsampling
+            tokens_in_level = h * w * vqvae_model.num_quantizers
+            token_len_per_level.append(tokens_in_level)
+        
+        total_seq_len = sum(token_len_per_level)
+        
+        # Start with a single start token (0)
+        generated_sequence = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+        
+        # Generate tokens autoregressively
+        for i in range(total_seq_len):
+            # Predict next token
+            next_token = transformer(generated_sequence, generation=True)
+            
+            # Add to sequence
+            generated_sequence = torch.cat([generated_sequence, next_token], dim=1)
+            
+            if i % 100 == 0:
+                print(f"Generated {i}/{total_seq_len} tokens")
+        
+        # Remove the initial start token
+        generated_sequence = generated_sequence[:, 1:]
+        
+        # Split the sequence back into levels and depths
+        split_indices = []
+        current_idx = 0
+        for level_len in token_len_per_level:
+            split_indices.append((current_idx, current_idx + level_len))
+            current_idx += level_len
+        
+        # Reconstruct the Laplacian pyramid
+        reconstructed_levels = []
+        
+        for level in range(vqvae_model.num_levels):
+            start_idx, end_idx = split_indices[level]
+            level_tokens = generated_sequence[:, start_idx:end_idx]
+            
+            # Reshape back to spatial dimensions
+            h = w = 256 // (2**(level+2))  # Same calculation as above
+            level_tokens = level_tokens.reshape(batch_size, h, w, vqvae_model.num_quantizers)
+            
+            # Convert tokens to quantized vectors
+            quantized = torch.zeros(batch_size, vqvae_model.quantizers[0].embedding_dim, h, w, device=device)
+            
+            for d in range(vqvae_model.num_quantizers):
+                depth_tokens = level_tokens[:, :, :, d].reshape(batch_size, -1)
+                # Get embeddings for these tokens
+                if hasattr(vqvae_model.quantizers[level], 'codebook'):
+                    # For ImprovedLaplacianVQVAE
+                    embeddings = vqvae_model.quantizers[level].codebook(depth_tokens)
+                else:
+                    # For LaplacianVQVAE
+                    embeddings = vqvae_model.quantizers[level].quantizers[d].embeddings(depth_tokens)
+                
+                embeddings = embeddings.reshape(batch_size, h, w, -1).permute(0, 3, 1, 2)
+                quantized += embeddings
+            
+            # Decode this level
+            reconstructed = vqvae_model.decoders[level](quantized)
+            reconstructed_levels.append(reconstructed)
+        
+        # Reconstruct full image from Laplacian pyramid
+        generated_images = reconstruct_from_laplacian_pyramid(reconstructed_levels)
+        
+        return generated_images
     
 # Additional functionality for model training and generation
 
@@ -1213,6 +1439,120 @@ def interpolate_in_latent_space(model, data1, data2, steps=10, device='cuda'):
 
 
 # Main training script with improved models
+# if __name__ == "__main__":
+#     import torch
+#     import torchvision
+#     from torchvision import datasets, transforms
+#     import matplotlib.pyplot as plt
+    
+#     # Hyperparameters
+#     batch_size = 32
+#     vqvae_epochs = 15
+#     transformer_epochs = 10
+#     learning_rate = 3e-4
+#     num_embeddings = 1024
+#     embedding_dim = 64
+#     num_quantizers = 4
+#     num_levels = 3
+#     temperature = 0.5  # Temperature for soft sampling
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+#     # Dataset
+#     transform = transforms.Compose([
+#         transforms.Resize(256),
+#         transforms.CenterCrop(256),
+#         transforms.ToTensor(),
+#         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+#     ])
+    
+#     # Use any dataset
+#     dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+#     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    
+#     # Create improved models
+#     vqvae_model = ImprovedLaplacianVQVAE(
+#         num_embeddings=num_embeddings,
+#         embedding_dim=embedding_dim,
+#         num_quantizers=num_quantizers,
+#         num_levels=num_levels,
+#         temperature=temperature
+#     )
+    
+#     rq_transformer = ImprovedRQTransformer(
+#         d_model=512,
+#         code_embedding_dim=embedding_dim,
+#         num_embeddings=num_embeddings,
+#         num_quantizers=num_quantizers
+#     )
+    
+#     # Optimizers
+#     vqvae_optimizer = torch.optim.Adam(vqvae_model.parameters(), lr=learning_rate)
+#     transformer_optimizer = torch.optim.Adam(rq_transformer.parameters(), lr=learning_rate)
+    
+#     # Train improved VQ-VAE first
+#     print("Training Improved Laplacian VQ-VAE...")
+#     vqvae_model = train_laplacian_vqvae(vqvae_model, dataloader, vqvae_optimizer, 
+#                                         epochs=vqvae_epochs, device=device)
+    
+#     # Save the model
+#     torch.save(vqvae_model.state_dict(), 'improved_laplacian_vqvae.pth')
+    
+#     # Visualize some reconstructions
+#     test_data = next(iter(dataloader))[:4]
+#     reconstruction_fig = visualize_reconstruction(vqvae_model, test_data, device=device)
+#     reconstruction_fig.savefig('reconstructions.png')
+    
+#     # Visualize Laplacian pyramid for a sample
+#     sample_pyramid = build_laplacian_pyramid(test_data[:1].to(device), num_levels=vqvae_model.num_levels-1)
+#     pyramid_fig = visualize_laplacian_pyramid(sample_pyramid)
+#     pyramid_fig.savefig('laplacian_pyramid.png')
+    
+#     # Train improved RQ Transformer
+#     print("Training Improved RQ Transformer...")
+#     rq_transformer = train_improved_rq_transformer(
+#         rq_transformer, vqvae_model, dataloader, transformer_optimizer, 
+#         epochs=transformer_epochs, device=device
+#     )
+    
+#     # Save the transformer model
+#     torch.save(rq_transformer.state_dict(), 'improved_rq_transformer.pth')
+    
+#     # Generate samples
+#     print("Generating samples...")
+#     samples = generate_images(rq_transformer, vqvae_model, num_images=4, device=device)
+    
+#     # Display samples
+#     samples = (samples + 1) / 2.0  # Denormalize
+#     samples = samples.cpu().permute(0, 2, 3, 1).numpy()
+    
+#     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+#     for i, ax in enumerate(axes.flat):
+#         if i < len(samples):
+#             ax.imshow(np.clip(samples[i], 0, 1))
+#             ax.axis('off')
+    
+#     plt.savefig('generated_samples.png')
+#     plt.close()
+    
+#     # Generate interpolations between two test images
+#     if test_data.shape[0] >= 2:
+#         print("Generating interpolations...")
+#         interpolations = interpolate_in_latent_space(
+#             vqvae_model, test_data[0], test_data[1], steps=8, device=device
+#         )
+        
+#         # Display interpolations
+#         interp_fig, axes = plt.subplots(1, 8, figsize=(16, 3))
+#         for i, ax in enumerate(axes):
+#             img = interpolations[i].permute(1, 2, 0).numpy()
+#             ax.imshow(np.clip(img, 0, 1))
+#             ax.axis('off')
+        
+#         plt.savefig('interpolations.png')
+#         plt.close()
+    
+#     print("Done!")
+
 if __name__ == "__main__":
     import torch
     import torchvision
@@ -1252,16 +1592,8 @@ if __name__ == "__main__":
         temperature=temperature
     )
     
-    rq_transformer = ImprovedRQTransformer(
-        d_model=512,
-        code_embedding_dim=embedding_dim,
-        num_embeddings=num_embeddings,
-        num_quantizers=num_quantizers
-    )
-    
     # Optimizers
     vqvae_optimizer = torch.optim.Adam(vqvae_model.parameters(), lr=learning_rate)
-    transformer_optimizer = torch.optim.Adam(rq_transformer.parameters(), lr=learning_rate)
     
     # Train improved VQ-VAE first
     print("Training Improved Laplacian VQ-VAE...")
@@ -1281,19 +1613,32 @@ if __name__ == "__main__":
     pyramid_fig = visualize_laplacian_pyramid(sample_pyramid)
     pyramid_fig.savefig('laplacian_pyramid.png')
     
-    # Train improved RQ Transformer
-    print("Training Improved RQ Transformer...")
-    rq_transformer = train_improved_rq_transformer(
-        rq_transformer, vqvae_model, dataloader, transformer_optimizer, 
+    # Create standard transformer
+    standard_transformer = StandardTransformer(
+        d_model=512,
+        nhead=8, 
+        num_layers=6,
+        code_embedding_dim=64,
+        num_embeddings=num_embeddings,
+        max_len=2000  # Adjust based on your sequence length
+    )
+    
+    # Train standard transformer
+    print("Training Standard Transformer...")
+    transformer_optimizer = torch.optim.Adam(standard_transformer.parameters(), lr=learning_rate)
+    standard_transformer = train_standard_transformer(
+        standard_transformer, vqvae_model, dataloader, transformer_optimizer, 
         epochs=transformer_epochs, device=device
     )
     
     # Save the transformer model
-    torch.save(rq_transformer.state_dict(), 'improved_rq_transformer.pth')
+    torch.save(standard_transformer.state_dict(), 'standard_transformer.pth')
     
     # Generate samples
     print("Generating samples...")
-    samples = generate_images(rq_transformer, vqvae_model, num_images=4, device=device)
+    samples = generate_images_with_standard_transformer(
+        standard_transformer, vqvae_model, num_images=4, device=device
+    )
     
     # Display samples
     samples = (samples + 1) / 2.0  # Denormalize
@@ -1307,22 +1652,5 @@ if __name__ == "__main__":
     
     plt.savefig('generated_samples.png')
     plt.close()
-    
-    # Generate interpolations between two test images
-    if test_data.shape[0] >= 2:
-        print("Generating interpolations...")
-        interpolations = interpolate_in_latent_space(
-            vqvae_model, test_data[0], test_data[1], steps=8, device=device
-        )
-        
-        # Display interpolations
-        interp_fig, axes = plt.subplots(1, 8, figsize=(16, 3))
-        for i, ax in enumerate(axes):
-            img = interpolations[i].permute(1, 2, 0).numpy()
-            ax.imshow(np.clip(img, 0, 1))
-            ax.axis('off')
-        
-        plt.savefig('interpolations.png')
-        plt.close()
     
     print("Done!")
