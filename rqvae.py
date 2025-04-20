@@ -361,14 +361,14 @@ class DepthTransformer(nn.Module):
     """
     def __init__(self, d_model=512, nhead=8, num_layers=2,
                  dim_feedforward=1024, dropout=0.1,
-                 num_embeddings=1024, num_quantizers=4):
+                 num_embeddings=1024, max_depth_positions=4):
         super(DepthTransformer, self).__init__()
         
         # Embedding layer for depth tokens
         self.token_embedding = nn.Embedding(num_embeddings, d_model)
         
         # Positional encoding for depth
-        self.depth_pos_encoding = nn.Embedding(num_quantizers, d_model)
+        self.depth_pos_encoding = nn.Embedding(max_depth_positions, d_model)
         
         # Transformer layers
         decoder_layer = nn.TransformerDecoderLayer(
@@ -1615,70 +1615,116 @@ if __name__ == "__main__":
     
     # Create a simplified transformer that still uses spatial and depth components
     class StandardSpatialDepthTransformer(nn.Module):
-        def __init__(self, d_model=512, spatial_nhead=8, depth_nhead=4,
-                    spatial_layers=6, depth_layers=2,
-                    code_embedding_dim=64, num_embeddings=1024, 
-                    num_quantizers=4, max_seq_len=64):
-            super(StandardSpatialDepthTransformer, self).__init__()
+    def __init__(self, d_model=512, spatial_nhead=8, depth_nhead=4,
+                spatial_layers=6, depth_layers=2,
+                code_embedding_dim=64, num_embeddings=1024, 
+                max_depth_positions=4, max_seq_len=64):
+        super(StandardSpatialDepthTransformer, self).__init__()
+        
+        self.num_embeddings = num_embeddings
+        self.max_depth_positions = max_depth_positions
+        
+        # Spatial transformer for modeling spatial dependencies
+        self.spatial_transformer = SpatialTransformer(
+            d_model=d_model,
+            nhead=spatial_nhead,
+            num_layers=spatial_layers,
+            code_embedding_dim=code_embedding_dim,
+            num_embeddings=num_embeddings,
+            max_len=max_seq_len
+        )
+        
+        # Depth transformer for predicting tokens at different depths
+        self.depth_transformer = DepthTransformer(
+            d_model=d_model,
+            nhead=depth_nhead,
+            num_layers=depth_layers,
+            num_embeddings=num_embeddings,
+            max_depth_positions=max_depth_positions
+        )
+        
+        # Start-of-sequence token embedding
+        self.sos_embedding = nn.Parameter(torch.randn(1, 1, code_embedding_dim))
+        
+    def forward(self, code_embeddings, target_indices=None, generation=False):
+        batch_size = code_embeddings.shape[0]
+        
+        # Add SOS token at the beginning
+        code_embeddings = torch.cat([
+            self.sos_embedding.expand(batch_size, -1, -1),
+            code_embeddings
+        ], dim=1)
+        
+        # Create causal mask for spatial transformer
+        seq_len = code_embeddings.shape[1]
+        spatial_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=code_embeddings.device) * float('-inf'),
+            diagonal=1
+        )
+        
+        # Run through spatial transformer
+        spatial_output = self.spatial_transformer(code_embeddings, spatial_mask)
+        
+        if generation:
+            # For inference, return just the last position's output
+            last_position = spatial_output[:, -1:, :]
             
-            self.num_embeddings = num_embeddings
-            self.num_quantizers = num_quantizers
-            
-            # Spatial transformer for modeling spatial dependencies
-            self.spatial_transformer = SpatialTransformer(
-                d_model=d_model,
-                nhead=spatial_nhead,
-                num_layers=spatial_layers,
-                code_embedding_dim=code_embedding_dim,
-                num_embeddings=num_embeddings,
-                max_len=max_seq_len
+            # Initialize with start tokens
+            current_depth_tokens = torch.zeros(
+                (batch_size, 1), dtype=torch.long, device=code_embeddings.device
             )
             
-            # Depth transformer for predicting tokens at different depths
-            self.depth_transformer = DepthTransformer(
-                d_model=d_model,
-                nhead=depth_nhead,
-                num_layers=depth_layers,
-                num_embeddings=num_embeddings,
-                num_quantizers=num_quantizers
-            )
+            all_depth_tokens = []
             
-            # Start-of-sequence token embedding
-            self.sos_embedding = nn.Parameter(torch.randn(1, 1, code_embedding_dim))
-            
-        def forward(self, code_embeddings, target_indices=None, generation=False):
-            batch_size = code_embeddings.shape[0]
-            
-            # Add SOS token at the beginning
-            code_embeddings = torch.cat([
-                self.sos_embedding.expand(batch_size, -1, -1),
-                code_embeddings
-            ], dim=1)
-            
-            # Create causal mask for spatial transformer
-            seq_len = code_embeddings.shape[1]
-            spatial_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=code_embeddings.device) * float('-inf'),
-                diagonal=1
-            )
-            
-            # Run through spatial transformer
-            spatial_output = self.spatial_transformer(code_embeddings, spatial_mask)
-            
-            if generation:
-                # For inference, return just the last position's output
-                last_position = spatial_output[:, -1:, :]
+            # Generate one token at a time for each depth
+            for d in range(self.max_depth_positions):
+                # Create causal mask for depth
+                depth_len = current_depth_tokens.shape[1]
+                depth_mask = torch.triu(
+                    torch.ones(depth_len, depth_len, device=code_embeddings.device) * float('-inf'),
+                    diagonal=1
+                )
                 
-                # Initialize with start tokens
+                # Predict next token
+                depth_logits = self.depth_transformer(
+                    current_depth_tokens, last_position, depth_mask
+                )
+                
+                # Get most likely token
+                next_token = torch.argmax(depth_logits[:, -1, :], dim=-1, keepdim=True)
+                
+                # Add to sequence
+                current_depth_tokens = torch.cat([current_depth_tokens, next_token], dim=1)
+                all_depth_tokens.append(next_token)
+            
+            # Return the predicted depth tokens (excluding start token)
+            return torch.cat(all_depth_tokens, dim=1)
+        
+        else:
+            # For training
+            outputs = []
+            
+            for i in range(1, seq_len):
+                current_position = spatial_output[:, i:i+1, :]
+                
+                # Get target indices for this position
+                target_for_position = target_indices[:, i-1, :]
+                
+                # Initialize with start token
                 current_depth_tokens = torch.zeros(
                     (batch_size, 1), dtype=torch.long, device=code_embeddings.device
                 )
                 
-                all_depth_tokens = []
-                
-                # Generate one token at a time for each depth
-                for d in range(self.num_quantizers):
-                    # Create causal mask for depth
+                # For each depth level
+                for d in range(self.max_depth_positions):
+                    # Add previous token for teacher forcing
+                    if d > 0:
+                        current_depth_tokens = torch.cat([
+                            current_depth_tokens, 
+                            target_for_position[:, d-1:d]
+                        ], dim=1)
+                    
+                    # Create mask for depth
                     depth_len = current_depth_tokens.shape[1]
                     depth_mask = torch.triu(
                         torch.ones(depth_len, depth_len, device=code_embeddings.device) * float('-inf'),
@@ -1687,62 +1733,17 @@ if __name__ == "__main__":
                     
                     # Predict next token
                     depth_logits = self.depth_transformer(
-                        current_depth_tokens, last_position, depth_mask
+                        current_depth_tokens, current_position, depth_mask
                     )
                     
-                    # Get most likely token
-                    next_token = torch.argmax(depth_logits[:, -1, :], dim=-1, keepdim=True)
-                    
-                    # Add to sequence
-                    current_depth_tokens = torch.cat([current_depth_tokens, next_token], dim=1)
-                    all_depth_tokens.append(next_token)
-                
-                # Return the predicted depth tokens (excluding start token)
-                return torch.cat(all_depth_tokens, dim=1)
+                    # Get prediction for this depth
+                    pred = depth_logits[:, -1:, :]
+                    outputs.append(pred)
             
-            else:
-                # For training
-                outputs = []
-                
-                for i in range(1, seq_len):
-                    current_position = spatial_output[:, i:i+1, :]
-                    
-                    # Get target indices for this position
-                    target_for_position = target_indices[:, i-1, :]
-                    
-                    # Initialize with start token
-                    current_depth_tokens = torch.zeros(
-                        (batch_size, 1), dtype=torch.long, device=code_embeddings.device
-                    )
-                    
-                    # For each depth level
-                    for d in range(self.num_quantizers):
-                        # Add previous token for teacher forcing
-                        if d > 0:
-                            current_depth_tokens = torch.cat([
-                                current_depth_tokens, 
-                                target_for_position[:, d-1:d]
-                            ], dim=1)
-                        
-                        # Create mask for depth
-                        depth_len = current_depth_tokens.shape[1]
-                        depth_mask = torch.triu(
-                            torch.ones(depth_len, depth_len, device=code_embeddings.device) * float('-inf'),
-                            diagonal=1
-                        )
-                        
-                        # Predict next token
-                        depth_logits = self.depth_transformer(
-                            current_depth_tokens, current_position, depth_mask
-                        )
-                        
-                        # Get prediction for this depth
-                        pred = depth_logits[:, -1:, :]
-                        outputs.append(pred)
-                
-                # Stack all predictions
-                return torch.stack(outputs, dim=1)
+            # Stack all predictions
+            return torch.stack(outputs, dim=1)
     
+    # Create the standard spatial-depth transformer
     # Create the standard spatial-depth transformer
     standard_transformer = StandardSpatialDepthTransformer(
         d_model=512,
@@ -1752,7 +1753,7 @@ if __name__ == "__main__":
         depth_layers=2,
         code_embedding_dim=embedding_dim,
         num_embeddings=num_embeddings,
-        num_quantizers=num_quantizers
+        max_depth_positions=num_quantizers  # Use the same value but with new parameter name
     )
     
     # Train transformer
