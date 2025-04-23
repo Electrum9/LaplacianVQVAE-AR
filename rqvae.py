@@ -86,12 +86,13 @@ class ResidualVectorQuantizer(nn.Module):
         return quantized, total_loss, indices_list
 
 
-class LaplacianVQVAE(nn.Module):
+# class LaplacianVQVAE(nn.Module):
+class WaveletVQVAE(nn.Module):
     """
-    VQ-VAE for Laplacian pyramid levels
+    VQ-VAE for Wavelet coefficients
     """
     def __init__(self, num_embeddings=1024, embedding_dim=64, num_quantizers=4, num_levels=3):
-        super(LaplacianVQVAE, self).__init__()
+        super().__init__()
         self.num_levels = num_levels
         
         # Encoders for each level of the Laplacian pyramid
@@ -107,7 +108,7 @@ class LaplacianVQVAE(nn.Module):
         
         # Residual Quantizers for each level
         self.quantizers = nn.ModuleList([
-            ResidualVectorQuantizer(num_embeddings, embedding_dim, num_quantizers)
+            VectorQuantizer(num_embeddings, embedding_dim)
             for _ in range(num_levels)
         ])
         
