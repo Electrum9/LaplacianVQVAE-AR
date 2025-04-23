@@ -445,7 +445,7 @@ class RQTransformer(nn.Module):
             nhead=depth_nhead,
             num_layers=depth_layers,
             num_embeddings=num_embeddings,
-            num_quantizers=num_quantizers
+            # num_quantizers=num_quantizers
         )
         
         # Start-of-sequence token embedding
