@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
-from rqvae import ImprovedLaplacianVQVAE, LaplacianVQVAE, RQTransformer, reconstruct_from_laplacian_pyramid
+from rqvae import ImprovedLaplacianVQVAE, LaplacianVQVAE, RQTransformer, build_laplacian_pyramid, reconstruct_from_laplacian_pyramid
 
 # First check if the code file containing the model definitions is imported
 # If not, we'll assume all model definitions are in the current scope
