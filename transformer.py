@@ -279,8 +279,9 @@ def train_standard_transformer(transformer_model, vqvae_model, train_data,
     # Number of batches
     num_samples = len(train_data)
     num_batches = (num_samples + batch_size - 1) // batch_size  # Ceiling division
-    
+    epoch_losses = []
     for epoch in range(epochs):
+
         total_loss = 0
         # Shuffle indices for this epoch
         indices = torch.randperm(num_samples)
@@ -354,6 +355,7 @@ def train_standard_transformer(transformer_model, vqvae_model, train_data,
         
         avg_loss = total_loss / num_batches
         print(f'Epoch: {epoch}, Average Loss: {avg_loss:.4f}')
+        epoch_losses.append(avg_loss)
         
         # Save checkpoint after each epoch
         os.makedirs('checkpoints', exist_ok=True)
@@ -366,7 +368,7 @@ def train_standard_transformer(transformer_model, vqvae_model, train_data,
     
     # Save final model
     torch.save(transformer_model.state_dict(), 'checkpoints/wavelet_transformer_final.pt')
-    return transformer_model
+    return transformer_model, epoch_losses
 
 def generate_images_with_transformer(transformer_model, vqvae_model, num_images=4, device=device):
     """
@@ -489,7 +491,7 @@ def main():
     
     # Train the transformer with manual batching
     print("Training Standard Transformer...")
-    transformer_model = train_standard_transformer(
+    transformer_model, epoch_losses = train_standard_transformer(
         transformer_model,
         vqvae_model,
         train_data,
@@ -502,7 +504,14 @@ def main():
     # Generate sample images
     print("Generating sample images...")
     generate_images_with_transformer(transformer_model, vqvae_model, num_images=4)
-    
+    plt.figure(figsize=(8, 5))
+    plt.plot(epoch_losses, marker='o')
+    plt.title("Transformer Training Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig("transformer_loss_plot.png")
+    plt.show()
     print("Done!")
 
 if __name__ == "__main__":
