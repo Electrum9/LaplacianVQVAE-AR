@@ -1,3 +1,4 @@
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -74,89 +75,125 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x)
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class WaveletTransformer(nn.Module):
-    """
-    Autoregressive Transformer model to predict sequences of wavelet coefficient indices.
-    """
-    def __init__(self, num_embeddings, embedding_dim, num_heads, num_layers, hidden_dim, max_seq_len, dropout=0.1):
-        """
-        Args:
-            num_embeddings (int): Number of embeddings in the VQ-VAE codebook. This is the vocab size.
-            embedding_dim (int): Dimension of the embeddings (should match VQ-VAE).
-            num_heads (int): Number of attention heads in the transformer.
-            num_layers (int): Number of transformer encoder layers.
-            hidden_dim (int): Dimension of the feedforward network model in transformer layers.
-            max_seq_len (int): Maximum expected sequence length for positional encoding.
-            dropout (float): Dropout rate.
-        """
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        num_heads: int,
+        num_layers: int,
+        hidden_dim: int,
+        max_seq_len: int,
+        quantized_shapes: List[Tuple[int,int,int]],
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.max_seq_len = max_seq_len
 
-        # Embedding layer for the discrete VQ indices
-        # Using num_embeddings directly as vocab size, assuming indices are 0 to num_embeddings-1
+        # quantized_shapes: [(B, H₀, W₀), (B, H₁, W₁), …]
+        self.quantized_shapes = quantized_shapes
+        # true full sequence length = Σ_i (H_i * W_i)
+        self.full_len = sum(h * w for (_, h, w) in quantized_shapes)
+
+        # token embedding + positional encoding
         self.token_embedding = nn.Embedding(num_embeddings, embedding_dim)
-        # Positional encoding
         self.pos_encoder = PositionalEncoding(embedding_dim, dropout, max_seq_len)
 
-        # Standard Transformer Encoder
-        encoder_layers = nn.TransformerEncoderLayer(
+        # split depth/spatial layers for the full path
+        depth_layers = num_layers // 2
+        spatial_layers = num_layers - depth_layers
+        depth_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             dropout=dropout,
-            batch_first=True, # Expect input as (Batch, Sequence, Feature)
-            activation=F.gelu # Using GELU activation
+            batch_first=True,
+            activation=F.gelu,
         )
-        # Layer normalization for stability
-        norm = nn.LayerNorm(embedding_dim)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers, norm=norm)
+        spatial_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            batch_first=True,
+            activation=F.gelu,
+        )
 
-        # Output layer to predict the next token index
-        self.output_layer = nn.Linear(embedding_dim, num_embeddings) # Predict logits for each codebook entry
+        self.depth_encoder = nn.TransformerEncoder(depth_layer, num_layers=depth_layers)
+        self.spatial_encoder = nn.TransformerEncoder(spatial_layer, num_layers=spatial_layers)
 
+        # tiny prefix encoder for short sequences
+        prefix_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            batch_first=True,
+            activation=F.gelu,
+        )
+        self.prefix_encoder = nn.TransformerEncoder(prefix_layer, num_layers=1)
+
+        # final projection
+        self.output_layer = nn.Linear(embedding_dim, num_embeddings)
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize weights for better training stability
         initrange = 0.1
         self.token_embedding.weight.data.uniform_(-initrange, initrange)
         self.output_layer.bias.data.zero_()
         self.output_layer.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, indices):
+
+    def forward(self, indices: torch.Tensor):
         """
-        Forward pass for training.
-        Args:
-            indices (Tensor): Input sequence of VQ indices (Batch Size, Sequence Length).
-        Returns:
-            logits (Tensor): Output logits for predicting the next index (Batch Size, Sequence Length, Num Embeddings).
+        indices: (B, S) where S may be short (<full_len, generation) or exactly full_len.
         """
-        # Embed the input indices
-        # Scale by sqrt(embedding_dim) as is common practice
-        embedded = self.token_embedding(indices) * math.sqrt(self.embedding_dim) # Shape: (B, S, D)
+        B, S = indices.shape
 
-        # Add positional encoding (adapting for batch_first=True)
-        # PositionalEncoding expects (Seq, Batch, Dim), TransformerEncoderLayer with batch_first=True expects (Batch, Seq, Dim)
-        embedded = embedded.permute(1, 0, 2) # (S, B, D)
-        embedded = self.pos_encoder(embedded)
-        embedded = embedded.permute(1, 0, 2) # (B, S, D)
+        # 1) embed + scale
+        x = self.token_embedding(indices) * math.sqrt(self.embedding_dim)  # (B, S, D)
+        # 2) add pos-encoding
+        x = x.permute(1, 0, 2)                                             # (S, B, D)
+        x = self.pos_encoder(x)
+        x = x.permute(1, 0, 2)                                             # (B, S, D)
+
+        # SHORT path: use the 1-layer prefix encoder for autoregressive gen
+        if S < self.full_len:
+            mask = nn.Transformer.generate_square_subsequent_mask(S).to(x.device)
+            x = self.prefix_encoder(x, mask=mask)                          # (B, S, D)
+            return self.output_layer(x)                                    # logits (B, S, V)
+
+        # FULL “axial” path: reshape into (B, D, H*W, emb) and do depth→spatial
+        # flatten all levels into one long sequence of length = full_len
+        D = len(self.quantized_shapes)
+        # assume for simplicity all levels share the same H,W but if they differ you can 
+        # un-flatten individually using quantized_shapes
+        _, H0, W0 = self.quantized_shapes[0]
+
+        x = x.view(B, D, H0*W0, self.embedding_dim)                        # (B, D, H*W, D)
+        # — depth mixing
+        x = x.permute(0, 2, 1, 3).reshape(B * (H0*W0), D, -1)              # (B·H·W, D, D)
+        x = self.depth_encoder(x)                                          # (B·H·W, D, D)
+        x = x.view(B, H0*W0, D, self.embedding_dim).permute(0, 2, 1, 3)    # (B, D, H·W, D)
+
+        # — spatial mixing (with causal mask per spatial block)
+        x = x.reshape(B*D, H0*W0, self.embedding_dim)                     # (B·D, H·W, D)
+        spatial_mask = nn.Transformer.generate_square_subsequent_mask(H0*W0).to(x.device)
+        x = self.spatial_encoder(x, mask=spatial_mask)                    # (B·D, H·W, D)
+
+        # back to flat and project
+        x = x.view(B, D, H0*W0, self.embedding_dim).permute(0, 2, 1, 3)    # (B, H·W, D, D)
+        x = x.reshape(B, S, self.embedding_dim)                            # (B, S, D)
+        return self.output_layer(x)                                        # (B, S, V)
 
 
-        # Generate a causal mask to prevent attending to future positions
-        seq_len = indices.size(1)
-        # Use nn.Transformer.generate_square_subsequent_mask
-        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(indices.device)
-
-        # Pass through the transformer encoder
-        # The mask should be (Seq_Len, Seq_Len) for batch_first=True
-        transformer_output = self.transformer_encoder(embedded, mask=mask, is_causal=False) # Set is_causal=False as mask is provided
-
-        # Predict the logits for the next token
-        logits = self.output_layer(transformer_output) # Shape: (B, S, Num_Embeddings)
-
-        return logits
 
     @torch.no_grad()
     def generate(self, start_indices, max_len, temperature=1.0, top_k=None):
@@ -528,7 +565,7 @@ if __name__ == "__main__":
     vqvae_model_path = "paths/wavelet_vqvae-original.pth" # Path to your trained VQVAE model
 
     # Transformer params
-    transformer_epochs = 5
+    transformer_epochs = 10
     transformer_lr = 1e-4
     transformer_heads = 8
     transformer_layers = 6
@@ -656,15 +693,15 @@ if __name__ == "__main__":
     # Initialize Transformer
     print("Initializing Transformer model...")
     transformer_model = WaveletTransformer(
-        num_embeddings=vqvae_num_embeddings, # Use the VQVAE codebook size
-        embedding_dim=vqvae_embedding_dim, # Transformer embedding dim must match VQVAE
+        num_embeddings=vqvae_num_embeddings,
+        embedding_dim=vqvae_embedding_dim,
         num_heads=transformer_heads,
         num_layers=transformer_layers,
         hidden_dim=transformer_hidden_dim,
-        max_seq_len=max_seq_len + 1, # Add +1 buffer for positional encoding range
-        dropout=transformer_dropout
-    )
-    transformer_model.to(device) # Move transformer model to device
+        max_seq_len=max_seq_len + 1,
+        quantized_shapes=quantized_shapes_ref,   # ← here
+        dropout=transformer_dropout,
+    ).to(device)
 
     # --- Training Setup ---
     optimizer = torch.optim.AdamW(transformer_model.parameters(), lr=transformer_lr)
