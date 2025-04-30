@@ -1,432 +1,709 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-import numpy as np
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-import pywt
+import math
 import ptwt
-from vqvae import WaveletVQVAE, get_wavelet_coeffs
+import pywt
+from datasets import load_dataset
+import torchmetrics
+
+# Assuming vqvae.py contains the WaveletVQVAE class and get_wavelet_coeffs function
+# Make sure vqvae.py is in the same directory or adjust the import path
+try:
+    from vqvae import WaveletVQVAE, get_wavelet_coeffs
+except ImportError:
+    print("Error: Could not import WaveletVQVAE or get_wavelet_coeffs from vqvae.py.")
+    print("Ensure vqvae.py exists and is in the correct path.")
+    exit()
+
+
+# TensorBoard for logging
 from torch.utils.tensorboard import SummaryWriter
 
-class WaveletTransformerDataset(Dataset):
+# Metrics
+ssim = torchmetrics.StructuralSimilarityIndexMeasure().to('cuda' if torch.cuda.is_available() else 'cpu')
+wavelet = pywt.Wavelet("db8") # Ensure this matches the wavelet used in vqvae.py
+
+# --- Helper Function for Data Transformation (Replaces Lambda) ---
+# Define the transform globally so it can be pickled
+global_transform = None # Will be initialized in main block
+
+def apply_transform(examples):
     """
-    Dataset for training the autoregressive transformer on wavelet VQ-VAE indices
+    Applies the global transform to a batch of images from the dataset.
+    Needed for multiprocessing in DataLoader.
     """
-    def __init__(self, dataloader, vqvae_model, device='cuda'):
-        self.indices_data = []
-        self.vqvae = vqvae_model.to(device)
-        self.vqvae.eval()
-        self.device = device
-        
-        print("Extracting indices from VQ-VAE...")
-        with torch.no_grad():
-            for batch in tqdm(dataloader):
-                # Get images from dataloader
-                images = batch['image'].to(device)
-                
-                # Get wavelet coefficients
-                wavelet_coeffs = get_wavelet_coeffs(images)
-                
-                # Extract quantized indices from VQ-VAE
-                _, _, all_indices = self.vqvae(wavelet_coeffs)
-                
-                # Store indices for each batch
-                for batch_idx in range(images.shape[0]):
-                    indices_per_level = []
-                    for level_idx in range(len(all_indices)):
-                        indices_per_level.append(all_indices[level_idx][batch_idx].cpu())
-                    self.indices_data.append(indices_per_level)
-        
-        print(f"Created dataset with {len(self.indices_data)} samples")
-    
-    def __len__(self):
-        return len(self.indices_data)
-    
-    def __getitem__(self, idx):
-        return self.indices_data[idx]
+    if global_transform is None:
+        raise ValueError("Global transform not initialized. Run the main script block.")
+    # Ensure images are RGB before transforming
+    processed_images = [global_transform(img.convert("RGB")) for img in examples["image"]]
+    return {"image": torch.stack(processed_images)}
+# --------------------------------------------------------------------
 
 
-class WaveletARTransformer(nn.Module):
+class PositionalEncoding(nn.Module):
     """
-    Autoregressive Transformer for generating wavelet coefficient tokens
+    Standard positional encoding for Transformers.
+    Adds sinusoidal positional information to input embeddings.
     """
-    def __init__(self, 
-                 num_embeddings=256, 
-                 embedding_dim=512, 
-                 num_heads=8, 
-                 num_layers=6, 
-                 dropout=0.1,
-                 num_levels=4):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Create positional encoding matrix
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1) # Shape: (max_len, 1, d_model)
+        self.register_buffer('pe', pe) # Register as buffer so it's not a model parameter
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor (Sequence Length, Batch Size, Embedding Dim)
+        Returns:
+            Tensor with added positional encoding.
+        """
+        # Add positional encoding to the input embeddings
+        # Ensure positional encoding length matches input sequence length
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+class WaveletTransformer(nn.Module):
+    """
+    Autoregressive Transformer model to predict sequences of wavelet coefficient indices.
+    """
+    def __init__(self, num_embeddings, embedding_dim, num_heads, num_layers, hidden_dim, max_seq_len, dropout=0.1):
+        """
+        Args:
+            num_embeddings (int): Number of embeddings in the VQ-VAE codebook. This is the vocab size.
+            embedding_dim (int): Dimension of the embeddings (should match VQ-VAE).
+            num_heads (int): Number of attention heads in the transformer.
+            num_layers (int): Number of transformer encoder layers.
+            hidden_dim (int): Dimension of the feedforward network model in transformer layers.
+            max_seq_len (int): Maximum expected sequence length for positional encoding.
+            dropout (float): Dropout rate.
+        """
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.num_levels = num_levels
-        
-        # Token embedding for each codebook index
+        self.max_seq_len = max_seq_len
+
+        # Embedding layer for the discrete VQ indices
+        # Using num_embeddings directly as vocab size, assuming indices are 0 to num_embeddings-1
         self.token_embedding = nn.Embedding(num_embeddings, embedding_dim)
-        
-        # Special tokens for each wavelet coefficient type (LL, LH, HL, HH)
-        self.coefficient_type_embedding = nn.Embedding(num_levels, embedding_dim)
-        
-        # Position embedding for spatial positions
-        self.max_sequence_length = 4096  # Adjust based on expected image size and levels
-        self.position_embedding = nn.Embedding(self.max_sequence_length, embedding_dim)
-        
-        # Transformer encoder
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(embedding_dim, dropout, max_seq_len)
+
+        # Standard Transformer Encoder
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=num_heads,
-            dim_feedforward=embedding_dim*4,
+            dim_feedforward=hidden_dim,
             dropout=dropout,
-            activation='gelu',
-            batch_first=True
+            batch_first=True, # Expect input as (Batch, Sequence, Feature)
+            activation=F.gelu # Using GELU activation
         )
-        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        # Output projection to predict next token
-        self.output_projection = nn.Linear(embedding_dim, num_embeddings)
-        
-        # Sequence ordering based on frequency bands
-        # Ordering tokens from lowest frequency (LL) to highest (HH)
-        self.register_buffer('sequence_order', torch.tensor([0, 1, 2, 3]))
-    
-    def get_position_ids(self, token_indices):
+        # Layer normalization for stability
+        norm = nn.LayerNorm(embedding_dim)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers, norm=norm)
+
+        # Output layer to predict the next token index
+        self.output_layer = nn.Linear(embedding_dim, num_embeddings) # Predict logits for each codebook entry
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize weights for better training stability
+        initrange = 0.1
+        self.token_embedding.weight.data.uniform_(-initrange, initrange)
+        self.output_layer.bias.data.zero_()
+        self.output_layer.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, indices):
         """
-        Create position indices for the flattened wavelet coefficients
-        """
-        batch_size = token_indices[0].shape[0]
-        position_ids = []
-        
-        position_offset = 0
-        for level_idx in range(self.num_levels):
-            level_shape = token_indices[level_idx].shape
-            num_positions = level_shape[1] * level_shape[2]
-            
-            level_position_ids = torch.arange(
-                position_offset, 
-                position_offset + num_positions, 
-                device=token_indices[0].device
-            ).expand(batch_size, -1)
-            
-            position_ids.append(level_position_ids.reshape(batch_size, -1))
-            position_offset += num_positions
-            
-        return torch.cat(position_ids, dim=1)
-    
-    def forward(self, token_indices, target_indices=None):
-        """
-        Forward pass through the transformer
-        
+        Forward pass for training.
         Args:
-            token_indices: List of token indices for each wavelet level [batch_size, height, width]
-            target_indices: List of target indices for next token prediction
-            
+            indices (Tensor): Input sequence of VQ indices (Batch Size, Sequence Length).
         Returns:
-            logits: Predicted token logits
-            loss: Cross-entropy loss if target_indices provided
+            logits (Tensor): Output logits for predicting the next index (Batch Size, Sequence Length, Num Embeddings).
         """
-        batch_size = token_indices[0].shape[0]
-        
-        # Flatten and concatenate all token indices
-        flattened_indices = []
-        coefficient_type_ids = []
-        
-        for level_idx in range(self.num_levels):
-            level_indices = token_indices[level_idx]
-            flattened_level = level_indices.reshape(batch_size, -1)
-            flattened_indices.append(flattened_level)
-            
-            # Add coefficient type IDs for this level
-            level_length = flattened_level.shape[1]
-            coefficient_type_ids.append(torch.full((batch_size, level_length), level_idx, device=level_indices.device))
-        
-        # Concatenate all tokens in order from low to high frequency
-        concatenated_indices = torch.cat(flattened_indices, dim=1)
-        concatenated_type_ids = torch.cat(coefficient_type_ids, dim=1)
-        
-        # Get position IDs
-        position_ids = self.get_position_ids(token_indices)
-        
-        # Get embeddings
-        token_embeddings = self.token_embedding(concatenated_indices)
-        coeff_type_embeddings = self.coefficient_type_embedding(concatenated_type_ids)
-        position_embeddings = self.position_embedding(position_ids)
-        
-        # Combine embeddings
-        embeddings = token_embeddings + coeff_type_embeddings + position_embeddings
-        
-        # Create attention mask for causal attention
-        seq_length = embeddings.shape[1]
-        attn_mask = torch.triu(
-            torch.ones(seq_length, seq_length, device=embeddings.device) * float('-inf'),
-            diagonal=1
-        )
-        
-        # Process through transformer
-        transformer_output = self.transformer(embeddings, mask=attn_mask)
-        
-        # Predict next token
-        logits = self.output_projection(transformer_output)
-        
-        # Calculate loss if target_indices provided
-        loss = None
-        if target_indices is not None:
-            # Flatten and concatenate target indices
-            flattened_targets = []
-            for level_idx in range(self.num_levels):
-                flattened_targets.append(target_indices[level_idx].reshape(batch_size, -1))
-            
-            # Concatenate and shift right for next token prediction
-            concatenated_targets = torch.cat(flattened_targets, dim=1)
-            
-            # Compute cross-entropy loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, self.num_embeddings), 
-                concatenated_targets.reshape(-1)
-            )
-        
-        return logits, loss
-    
-    def generate(self, vqvae_model, batch_size=1, device='cuda', temperature=1.0):
-        """
-        Generate new wavelet coefficients autoregressively
-        
-        Args:
-            vqvae_model: Trained WaveletVQVAE model
-            batch_size: Number of images to generate
-            temperature: Temperature for sampling
-            
-        Returns:
-            reconstructed_image: Generated image
-        """
-        self.eval()
-        vqvae_model.eval()
-        
-        with torch.no_grad():
-            # Initialize empty token sequences for each level
-            token_sequences = []
-            sequence_lengths = []
-            
-            # Determine sequence lengths for each level based on typical image size
-            # For simplicity, assume square images and power-of-2 dimensions
-            base_size = 8  # Base size for the smallest feature maps
-            for level_idx in range(self.num_levels):
-                # Size increases as we go to lower frequencies
-                # Adjust these calculations based on your specific architecture
-                size = base_size * (2 ** (self.num_levels - level_idx - 1))
-                sequence_lengths.append(size * size)
-                
-                # Initialize with zeros
-                token_sequences.append(
-                    torch.zeros((batch_size, size, size), dtype=torch.long, device=device)
-                )
-            
-            # Total sequence length
-            total_length = sum(sequence_lengths)
-            
-            # Generate tokens autoregressively
-            for pos in tqdm(range(total_length), desc="Generating tokens"):
-                # Determine which level and position we're currently generating
-                level_idx = 0
-                remaining_pos = pos
-                
-                while level_idx < self.num_levels - 1 and remaining_pos >= sequence_lengths[level_idx]:
-                    remaining_pos -= sequence_lengths[level_idx]
-                    level_idx += 1
-                
-                # Get spatial coordinates from flattened position
-                size = int(np.sqrt(sequence_lengths[level_idx]))
-                h, w = remaining_pos // size, remaining_pos % size
-                
-                # Forward pass to get logits
-                logits, _ = self.forward(token_sequences)
-                
-                # Extract relevant logits
-                flattened_indices = []
-                for l_idx in range(self.num_levels):
-                    flattened_indices.append(token_sequences[l_idx].reshape(batch_size, -1))
-                
-                concatenated_indices = torch.cat(flattened_indices, dim=1)
-                relevant_pos = sum(sequence_lengths[:level_idx]) + (h * size + w)
-                next_token_logits = logits[:, relevant_pos, :]
-                
-                # Sample next token
-                if temperature == 0:
-                    # Greedy sampling
-                    next_token = torch.argmax(next_token_logits, dim=-1)
-                else:
-                    # Temperature sampling
-                    probs = F.softmax(next_token_logits / temperature, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                
-                # Update token sequence
-                token_sequences[level_idx][:, h, w] = next_token
-            
-            # Decode generated tokens using the VQ-VAE
-            reconstructed_coeffs = []
-            for level_idx in range(self.num_levels):
-                # Use the quantizer directly to get embeddings
-                indices = token_sequences[level_idx]
-                batch_size, h, w = indices.shape
-                
-                # Get embeddings from indices
-                flat_indices = indices.reshape(-1)
-                embeddings = vqvae_model.quantizers[level_idx].embeddings(flat_indices)
-                quantized = embeddings.reshape(batch_size, h, w, -1).permute(0, 3, 1, 2)
-                
-                # Decode using the corresponding decoder
-                reconstructed = vqvae_model.decoders[level_idx](quantized)
-                reconstructed_coeffs.append(reconstructed)
-            
-            # Reconstruct image from wavelet coefficients
-            LL, LH, HL, HH = reconstructed_coeffs
-            rc = (LL, (LH, HL, HH))
-            reconstructed_image = ptwt.waverec2(rc, pywt.Wavelet("db8"))
-            
-            return reconstructed_image
+        # Embed the input indices
+        # Scale by sqrt(embedding_dim) as is common practice
+        embedded = self.token_embedding(indices) * math.sqrt(self.embedding_dim) # Shape: (B, S, D)
+
+        # Add positional encoding (adapting for batch_first=True)
+        # PositionalEncoding expects (Seq, Batch, Dim), TransformerEncoderLayer with batch_first=True expects (Batch, Seq, Dim)
+        embedded = embedded.permute(1, 0, 2) # (S, B, D)
+        embedded = self.pos_encoder(embedded)
+        embedded = embedded.permute(1, 0, 2) # (B, S, D)
 
 
-def train_wavelet_transformer(model, dataset, optimizer, epochs=10, batch_size=32, device='cuda'):
+        # Generate a causal mask to prevent attending to future positions
+        seq_len = indices.size(1)
+        # Use nn.Transformer.generate_square_subsequent_mask
+        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(indices.device)
+
+        # Pass through the transformer encoder
+        # The mask should be (Seq_Len, Seq_Len) for batch_first=True
+        transformer_output = self.transformer_encoder(embedded, mask=mask, is_causal=False) # Set is_causal=False as mask is provided
+
+        # Predict the logits for the next token
+        logits = self.output_layer(transformer_output) # Shape: (B, S, Num_Embeddings)
+
+        return logits
+
+    @torch.no_grad()
+    def generate(self, start_indices, max_len, temperature=1.0, top_k=None):
+        """
+        Autoregressively generate a sequence of indices.
+        Args:
+            start_indices (Tensor): Initial sequence of indices (Batch Size, Start Seq Len).
+            max_len (int): Maximum length of the sequence to generate.
+            temperature (float): Softmax temperature for sampling. Lower values make it more deterministic.
+            top_k (int, optional): If set, sample only from the top k most likely next tokens.
+        Returns:
+            generated_indices (Tensor): Generated sequence of indices (Batch Size, max_len).
+        """
+        self.eval() # Set model to evaluation mode
+        generated = start_indices
+        batch_size = start_indices.size(0)
+
+        for _ in tqdm(range(max_len - start_indices.size(1)), desc="Generating"):
+            # Get the current sequence (ensure it doesn't exceed max_seq_len for positional encoding)
+            current_indices = generated[:, -self.max_seq_len:] # Use only the last max_seq_len tokens
+
+            # Get logits from the model
+            logits = self(current_indices) # (Batch, Current Seq Len, Num Embeddings)
+
+            # Focus only on the logits for the next step (last position)
+            next_token_logits = logits[:, -1, :] # (Batch, Num Embeddings)
+
+            # Apply temperature scaling
+            next_token_logits = next_token_logits / temperature
+
+            # Optional Top-K sampling
+            if top_k is not None:
+                v, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
+                next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
+
+            # Apply softmax to get probabilities
+            probs = F.softmax(next_token_logits, dim=-1) # (Batch, Num Embeddings)
+
+            # Sample the next token index
+            next_token = torch.multinomial(probs, num_samples=1) # (Batch, 1)
+
+            # Append the sampled token to the sequence
+            generated = torch.cat((generated, next_token), dim=1)
+
+        self.train() # Set model back to training mode
+        return generated
+
+
+# --- Training Function ---
+def train_transformer(transformer_model, vqvae_model, dataloader, optimizer, criterion, epochs, device, writer, max_seq_len):
     """
-    Train the wavelet autoregressive transformer
+    Train the Wavelet Transformer model.
     """
-    writer = SummaryWriter(log_dir="runs/wavelet_transformer")
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model.to(device)
-    model.train()
-    
-    print("Training Wavelet AR Transformer...")
+    transformer_model.to(device)
+    vqvae_model.to(device)
+    vqvae_model.eval() # Freeze VQ-VAE weights
+
+    print("Training Wavelet Transformer...")
+    global_step = 0
+    quantized_shapes_epoch = None # Store shapes from the first batch of the first epoch
+
     for epoch in range(epochs):
+        transformer_model.train() # Set transformer to training mode
         total_loss = 0
-        loop = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
-        
+        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", leave=True)
+
         for batch_idx, data in enumerate(loop):
-            # Each data item is a list of indices for each wavelet level
-            token_indices = [indices.to(device) for indices in data]
-            
-            # Create target indices by offsetting (for autoregressive prediction)
-            target_indices = []
-            for level_indices in token_indices:
-                # Shift left by 1 for next token prediction
-                target = torch.roll(level_indices, shifts=-1, dims=2)
-                # Mark the last column as padding (could use special token)
-                target[:, :, -1] = 0
-                target_indices.append(target)
-            
-            # Forward pass
-            _, loss = model(token_indices, target_indices)
-            
-            # Backward pass
+            # Check if data is a dictionary and has the 'image' key
+            if isinstance(data, dict) and 'image' in data:
+                images = data["image"].to(device)
+            elif isinstance(data, torch.Tensor): # Handle cases where DataLoader might return only tensors
+                 images = data.to(device)
+            else:
+                print(f"Warning: Unexpected data format received from DataLoader: {type(data)}. Skipping batch.")
+                continue
+
+            # Ensure images have 3 channels (handle potential grayscale)
+            if images.shape[1] == 1:
+                images = images.repeat(1, 3, 1, 1)
+
+            with torch.no_grad(): # Don't need gradients for VQ-VAE part
+                # 1. Get Wavelet Coefficients
+                try:
+                    wavelet_coeffs = get_wavelet_coeffs(images) # List [LL, LH, HL, HH]
+                except Exception as e:
+                    print(f"Error getting wavelet coeffs: {e}. Skipping batch.")
+                    print(f"Image shape: {images.shape}")
+                    continue
+
+
+                # 2. Encode and Quantize using VQ-VAE to get indices
+                all_indices = []
+                quantized_shapes_batch = [] # Store shapes for this batch
+                try:
+                    for i in range(len(wavelet_coeffs)):
+                        # Check if wavelet coeff tensor is valid
+                        if not isinstance(wavelet_coeffs[i], torch.Tensor) or wavelet_coeffs[i].numel() == 0:
+                             print(f"Warning: Invalid wavelet coefficient at index {i}. Skipping subband.")
+                             continue
+
+                        encoded = vqvae_model.encoders[i](wavelet_coeffs[i])
+                        _, _, indices = vqvae_model.quantizers[i](encoded) # We only need indices
+                        quantized_shapes_batch.append(indices.shape) # Store shape (B, H_i, W_i)
+                        # Flatten indices: (B, H_i, W_i) -> (B, H_i * W_i)
+                        all_indices.append(indices.view(images.size(0), -1))
+
+                    # Store shapes from the first batch of the first epoch
+                    if epoch == 0 and batch_idx == 0:
+                        quantized_shapes_epoch = quantized_shapes_batch
+
+                except Exception as e:
+                    print(f"Error during VQ-VAE encoding/quantization: {e}. Skipping batch.")
+                    continue
+
+                # Check if any indices were generated
+                if not all_indices:
+                    print("Warning: No indices generated for this batch. Skipping.")
+                    continue
+
+                # 3. Concatenate indices from all subbands into a single sequence
+                # Shape: (B, total_indices_length) where total_indices_length = sum(H_i * W_i)
+                indices_sequence = torch.cat(all_indices, dim=1)
+
+                # Ensure sequence length is reasonable
+                current_seq_len = indices_sequence.size(1)
+                if current_seq_len > max_seq_len:
+                     # print(f"Warning: Sequence length {current_seq_len} exceeds max_seq_len {max_seq_len}. Truncating.")
+                     indices_sequence = indices_sequence[:, :max_seq_len]
+                elif current_seq_len < 2: # Need at least 2 tokens for input/target pair
+                    print(f"Warning: Sequence length {current_seq_len} is too short (< 2). Skipping batch.")
+                    continue
+
+
+            # 4. Prepare input and target sequences for Transformer
+            # Input: indices_sequence[:, :-1] (all tokens except the last)
+            # Target: indices_sequence[:, 1:] (all tokens except the first)
+            input_seq = indices_sequence[:, :-1]
+            target_seq = indices_sequence[:, 1:]
+
+            if input_seq.size(1) == 0: # Check if sequence became too short after slicing
+                print(f"Warning: Input sequence length is 0 after slicing. Skipping batch.")
+                continue
+
+
+            # 5. Forward pass through Transformer
             optimizer.zero_grad()
+            try:
+                logits = transformer_model(input_seq) # Shape: (B, Seq_Len-1, Num_Embeddings)
+            except Exception as e:
+                 print(f"Error during Transformer forward pass: {e}")
+                 print(f"Input sequence shape: {input_seq.shape}")
+                 continue
+
+
+            # 6. Calculate Loss
+            # Reshape logits and targets for CrossEntropyLoss
+            # Logits: (B * (Seq_Len-1), Num_Embeddings)
+            # Target: (B * (Seq_Len-1))
+            try:
+                loss = criterion(logits.reshape(-1, logits.size(-1)), target_seq.reshape(-1))
+            except Exception as e:
+                print(f"Error calculating loss: {e}")
+                print(f"Logits shape: {logits.shape}, Target shape: {target_seq.shape}")
+                continue
+
+
+            # 7. Backward pass and optimization
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(transformer_model.parameters(), 1.0) # Gradient clipping
             optimizer.step()
-            
+
             total_loss += loss.item()
-            
             loop.set_postfix(loss=loss.item())
-            writer.add_scalar("Loss/train", loss.item(), batch_idx + epoch * len(dataloader))
-            
-            if batch_idx % 100 == 0:
-                print(f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {loss.item():.4f}")
-        
-        print(f"Epoch: {epoch}, Average Loss: {total_loss/len(dataloader):.4f}")
-        
-        # Sample and save generated images periodically
-        if epoch % 5 == 0 or epoch == epochs - 1:
-            model.eval()
-            vqvae_model = WaveletVQVAE(num_embeddings=model.num_embeddings, embedding_dim=64, num_levels=model.num_levels)
-            vqvae_model.load_state_dict(torch.load("wavelet_vqvae.pth"))
-            vqvae_model.to(device)
-            
-            with torch.no_grad():
-                generated_images = model.generate(vqvae_model, batch_size=4, device=device)
-                for i in range(min(4, generated_images.shape[0])):
-                    writer.add_image(f"Generated_Image_{i}", generated_images[i], epoch)
-            
-            model.train()
-    
-    return model
+            writer.add_scalar("Transformer Loss/train", loss.item(), global_step)
+            global_step += 1
+
+        # Avoid division by zero if dataloader is empty or all batches were skipped
+        if len(dataloader) > 0 and len(loop) > 0 :
+             avg_loss = total_loss / len(loop) # Use len(loop) as it reflects processed batches
+             print(f"Epoch {epoch+1}/{epochs}, Average Transformer Loss: {avg_loss:.4f}")
+             writer.add_scalar("Transformer Loss/epoch", avg_loss, epoch)
+        else:
+             print(f"Epoch {epoch+1}/{epochs}, No batches processed.")
+
+
+    print("Transformer training finished.")
+    # Return the shapes captured from the first batch
+    if quantized_shapes_epoch is None:
+        print("Warning: Could not capture quantized shapes during training.")
+    return transformer_model, quantized_shapes_epoch
+
+# --- Reconstruction Function ---
+@torch.no_grad()
+def calculate_reconstruction(transformer_model, vqvae_model, quantized_shapes, num_samples, max_gen_len, device, start_token_idx=0):
+    """
+    Generates samples using the transformer and reconstructs images using the VQ-VAE decoder.
+    Calculates reconstruction metrics (L1, SSIM).
+
+    Args:
+        transformer_model: Trained WaveletTransformer.
+        vqvae_model: Pre-trained WaveletVQVAE.
+        quantized_shapes: List of shapes [(B, H_i, W_i), ...] for each subband's indices map.
+                           (Note: B here is dummy, only H, W are needed).
+        num_samples (int): Number of samples to generate and reconstruct.
+        max_gen_len (int): The total length of the concatenated index sequence to generate.
+        device: Torch device ('cuda' or 'cpu').
+        start_token_idx (int): Index to use as the starting token for generation.
+    """
+    if quantized_shapes is None:
+        print("Error in calculate_reconstruction: quantized_shapes is None. Cannot proceed.")
+        return
+
+    transformer_model.eval()
+    vqvae_model.eval()
+    transformer_model.to(device)
+    vqvae_model.to(device)
+
+    print(f"\nGenerating {num_samples} samples and calculating reconstruction loss...")
+
+    # Prepare starting sequence (e.g., a single start token)
+    # Ensure start_token_idx is within the valid range (0 to num_embeddings-1)
+    valid_start_token = max(0, min(start_token_idx, transformer_model.num_embeddings - 1))
+    start_indices = torch.full((num_samples, 1), valid_start_token, dtype=torch.long, device=device)
+
+    # Generate full index sequences using the transformer
+    generated_indices_flat = transformer_model.generate(start_indices, max_gen_len, temperature=0.7) # (B, max_gen_len)
+
+    # --- Decode generated indices using VQ-VAE ---
+    reconstructed_coeffs = []
+    current_idx = 0
+    # Get codebook embeddings from VQ-VAE quantizers
+    try:
+        codebooks = [q.embeddings.weight.data for q in vqvae_model.quantizers] # List of (num_embed, embed_dim)
+    except AttributeError:
+        print("Error accessing VQ-VAE quantizer embeddings. Check vqvae_model structure.")
+        return
+
+
+    for i in range(len(quantized_shapes)): # Iterate through LL, LH, HL, HH
+        # Get the shape (H, W) for the current subband's index map
+        # Use shape from the first batch element as reference: quantized_shapes[i][1:]
+        try:
+            if len(quantized_shapes[i]) < 3:
+                 print(f"Error: Invalid shape format in quantized_shapes at index {i}: {quantized_shapes[i]}")
+                 continue
+            h, w = quantized_shapes[i][1], quantized_shapes[i][2]
+            num_indices_level = h * w
+        except IndexError:
+            print(f"Error accessing shape dimensions in quantized_shapes at index {i}: {quantized_shapes[i]}")
+            continue
+
+
+        # Extract the portion of generated indices for this level
+        # Ensure we don't index out of bounds
+        end_idx = current_idx + num_indices_level
+        if end_idx > generated_indices_flat.size(1):
+            print(f"Warning: Not enough generated indices ({generated_indices_flat.size(1)}) to reconstruct level {i} (needed {end_idx}). Skipping level.")
+            # Optionally pad or handle differently
+            continue # Skip this level if not enough indices
+
+
+        indices_level_flat = generated_indices_flat[:, current_idx : end_idx]
+        current_idx = end_idx # Update current index position
+
+        # Check if extracted indices match expected number
+        if indices_level_flat.size(1) != num_indices_level:
+             print(f"Warning: Mismatch in expected ({num_indices_level}) vs extracted ({indices_level_flat.size(1)}) indices for level {i}. Reshaping might fail.")
+             # Attempt to pad or truncate if necessary, or skip
+             # Padding example (if fewer indices generated):
+             if indices_level_flat.size(1) < num_indices_level:
+                 padding_size = num_indices_level - indices_level_flat.size(1)
+                 # Pad with a default index, e.g., 0
+                 padding = torch.zeros((num_samples, padding_size), dtype=torch.long, device=device)
+                 indices_level_flat = torch.cat([indices_level_flat, padding], dim=1)
+             # Truncating example (if more indices generated - less likely here)
+             # indices_level_flat = indices_level_flat[:, :num_indices_level]
+
+
+        # Reshape indices back to (B, H, W)
+        try:
+            indices_level = indices_level_flat.view(num_samples, h, w)
+        except RuntimeError as e:
+            print(f"Error reshaping indices for level {i}: {e}")
+            print(f"Target shape: ({num_samples}, {h}, {w}), Flat shape: {indices_level_flat.shape}")
+            continue # Skip this level
+
+        # Map indices to embeddings
+        # Ensure indices are within the valid range for the codebook
+        indices_level = torch.clamp(indices_level, 0, codebooks[i].size(0) - 1)
+        try:
+            # Shape: (B, H, W, embedding_dim)
+            quantized_level = F.embedding(indices_level, codebooks[i])
+        except IndexError as e:
+             print(f"Error during embedding lookup for level {i}: {e}")
+             print(f"Max index found: {indices_level.max()}, Codebook size: {codebooks[i].size(0)}")
+             continue # Skip this level
+
+
+        # Permute to (B, embedding_dim, H, W) for the decoder
+        quantized_level = quantized_level.permute(0, 3, 1, 2).contiguous()
+
+        # Decode using the corresponding VQ-VAE decoder
+        try:
+            recon_coeff = vqvae_model.decoders[i](quantized_level)
+            reconstructed_coeffs.append(recon_coeff)
+        except Exception as e:
+             print(f"Error during VQ-VAE decoding for level {i}: {e}")
+             continue # Skip appending this coefficient
+
+
+    # Check if we have the correct number of coefficients for reconstruction
+    if len(reconstructed_coeffs) != vqvae_model.num_levels: # num_levels should be 4 (LL, LH, HL, HH)
+        print(f"Error: Expected {vqvae_model.num_levels} reconstructed coefficients, but got {len(reconstructed_coeffs)}. Cannot perform inverse wavelet transform.")
+        return
+
+    # Reconstruct the final image using inverse wavelet transform
+    try:
+        LL, LH, HL, HH = reconstructed_coeffs
+        rc = (LL, (LH, HL, HH))
+        reconstructed_images = ptwt.waverec2(rc, wavelet) # Shape: (B, C, H_orig, W_orig)
+        print("Sample generation and decoding complete.")
+
+        # --- Optional: Compare with original images if available ---
+        # You would need a validation dataloader here
+        # val_dataloader = DataLoader(...) # Define your validation loader
+        # try:
+        #     original_batch = next(iter(val_dataloader))
+        #     original_images = original_batch['image'][:num_samples].to(device)
+        #     # Ensure shapes match for comparison
+        #     if reconstructed_images.shape == original_images.shape:
+        #         l1_loss = F.l1_loss(reconstructed_images, original_images)
+        #         # Ensure data range is appropriate for SSIM (e.g., [0, 1] or [-1, 1])
+        #         # Assuming images are [-1, 1] from normalization
+        #         ssim_score = ssim(reconstructed_images, original_images)
+        #         print(f"Reconstruction L1 Loss (vs validation): {l1_loss.item():.4f}")
+        #         print(f"Reconstruction SSIM (vs validation): {ssim_score.item():.4f}")
+        #     else:
+        #         print("Shape mismatch between reconstructed and original images. Cannot calculate metrics.")
+        #         print(f"Reconstructed shape: {reconstructed_images.shape}, Original shape: {original_images.shape}")
+        # except StopIteration:
+        #     print("Validation dataloader is empty. Cannot compare with original images.")
+
+
+        # Save generated images (unnormalize first)
+        import torchvision.utils as vutils
+        save_path = 'generated_samples.png'
+        vutils.save_image(reconstructed_images.clamp(-1, 1).add(1).mul(0.5), save_path, nrow=int(math.sqrt(num_samples)))
+        print(f"Generated samples saved to {save_path}")
+
+    except ValueError as e:
+         print(f"Error during inverse wavelet transform or saving: {e}")
+         print("Check coefficient shapes and compatibility.")
+    except Exception as e:
+        print(f"An unexpected error occurred during reconstruction finalization: {e}")
+
 
 
 if __name__ == "__main__":
-    import torchvision.transforms as transforms
-    from datasets import load_dataset
-    
-    # Hyperparameters
-    batch_size = 32
-    transformer_epochs = 10
-    learning_rate = 3e-4
-    num_embeddings = 256
-    embedding_dim = 512  # For transformer
-    num_heads = 8
-    num_layers = 6
-    num_levels = 4
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = "cpu"
-    
-    # Load the dataset
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ])
-    
-    dset = load_dataset("merkol/ffhq-256", split="train")
-    dset.set_transform(lambda examples: {
-        "image": torch.stack([transform(img) for img in examples["image"]])
-    })
-    dataloader = DataLoader(dset, batch_size=batch_size, shuffle=True)
-    
-    # Load trained VQ-VAE model
-    vqvae_model = WaveletVQVAE(num_embeddings=num_embeddings, embedding_dim=64, num_levels=num_levels)
-    vqvae_model.load_state_dict(torch.load("wavelet_vqvae.pth"))
-    vqvae_model.eval()  # Set to evaluation mode
-    
-    # Create transformer dataset
-    transformer_dataset = WaveletTransformerDataset(dataloader, vqvae_model, device=device)
-    
-    # Create transformer model
-    transformer_model = WaveletARTransformer(
-        num_embeddings=num_embeddings,
-        embedding_dim=embedding_dim,
-        num_heads=num_heads,
-        num_layers=num_layers,
-        num_levels=num_levels
+    # --- Hyperparameters ---
+    # Data
+    batch_size = 16 # Adjust based on GPU memory
+    image_size = 128 # IMPORTANT: Make sure this matches VQVAE training
+    num_workers = 0 # Set to 0 to avoid multiprocessing issues initially, increase later if needed
+
+    # VQ-VAE params (MUST match the loaded model)
+    vqvae_num_embeddings = 256
+    vqvae_embedding_dim = 64
+    vqvae_num_levels = 4 # LL, LH, HL, HH (Should match the loaded VQVAE model structure)
+    vqvae_model_path = "paths/wavelet_vqvae-original.pth" # Path to your trained VQVAE model
+
+    # Transformer params
+    transformer_epochs = 5
+    transformer_lr = 1e-4
+    transformer_heads = 8
+    transformer_layers = 6
+    transformer_hidden_dim = 2048 # Feedforward dim in TransformerEncoderLayer
+    transformer_dropout = 0.1
+    # max_seq_len will be determined dynamically
+
+    # Device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # --- Data Loading ---
+    # Initialize the global transform used by the apply_transform function
+    global_transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)), # Ensure consistent size
+            transforms.ToTensor(), # Converts PIL image to a tensor in [0, 1]
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)), # Normalize to [-1, 1]
+        ]
     )
-    
-    # Optimizer
-    transformer_optimizer = torch.optim.Adam(transformer_model.parameters(), lr=learning_rate)
-    
-    # Train transformer model
-    print("Training Wavelet Autoregressive Transformer...")
-    transformer_model = train_wavelet_transformer(
-        transformer_model,
-        transformer_dataset,
-        transformer_optimizer,
-        epochs=transformer_epochs,
+
+    # Using FFHQ dataset as an example
+    dataset_name = "merkol/ffhq-256"
+    try:
+        # Load only a small part for faster testing/debugging
+        # dset = load_dataset(dataset_name, split="train[:1%]") # Use 1% of data
+        dset = load_dataset(dataset_name, split="train") # Use full dataset for actual training
+        print(f"Dataset '{dataset_name}' loaded successfully.")
+    except Exception as e:
+        print(f"Could not load dataset '{dataset_name}'. Error: {e}")
+        print("Please ensure the dataset is available or replace with another.")
+        exit()
+
+    # Use the named function for the transform
+    dset.set_transform(apply_transform)
+
+    # Limit dataset size for faster example run (optional, remove for full training)
+    # dset = dset.select(range(1000))
+
+    dataloader = DataLoader(
+        dset,
         batch_size=batch_size,
-        device=device
+        shuffle=True,
+        num_workers=num_workers, # Use 0 first to ensure no pickling errors
+        pin_memory=True if device == "cuda" else False,
+        drop_last=True # Drop last incomplete batch
     )
-    
-    # Save model
-    torch.save(transformer_model.state_dict(), "wavelet_transformer.pth")
-    
-    # Generate samples
-    print("Generating samples...")
-    transformer_model.eval()
-    with torch.no_grad():
-        generated_images = transformer_model.generate(vqvae_model, batch_size=16, device=device)
-    
-    # Calculate reconstruction loss
-    original_images = next(iter(dataloader))["image"].to(device)[:16]
-    mse_loss = F.mse_loss(generated_images, original_images)
-    l1_loss = F.l1_loss(generated_images, original_images)
-    
-    import torchmetrics
-    ssim = torchmetrics.StructuralSimilarityIndexMeasure().to(device)
-    ssim_score = ssim(generated_images, original_images)
-    
-    print(f"Generation Results:")
-    print(f"MSE Loss: {mse_loss.item():.4f}")
-    print(f"L1 Loss: {l1_loss.item():.4f}")
-    print(f"SSIM Score: {ssim_score.item():.4f}")
+    print(f"DataLoader created with batch_size={batch_size}, num_workers={num_workers}")
+
+
+    # --- Model Loading and Initialization ---
+
+    # Load pre-trained VQ-VAE
+    print(f"Loading pre-trained VQ-VAE from {vqvae_model_path}...")
+    # Ensure the VQVAE class matches the saved state dict structure
+    vqvae_model = WaveletVQVAE(
+        num_embeddings=vqvae_num_embeddings,
+        embedding_dim=vqvae_embedding_dim,
+        num_levels=vqvae_num_levels, # Crucial: Must match the definition in vqvae.py used for training
+    )
+    try:
+        vqvae_model.load_state_dict(torch.load(vqvae_model_path, map_location=device))
+        print("VQ-VAE model loaded successfully.")
+    except FileNotFoundError:
+        print(f"Error: VQ-VAE model file not found at {vqvae_model_path}. Please train VQ-VAE first or check path.")
+        exit()
+    except RuntimeError as e:
+         print(f"Error loading VQ-VAE state dict: {e}")
+         print("This often means the WaveletVQVAE class definition in vqvae.py does not match the saved model structure.")
+         print(f"Ensure num_levels={vqvae_num_levels} and other parameters match the saved model.")
+         exit()
+    except Exception as e:
+        print(f"An unexpected error occurred loading VQ-VAE state dict: {e}")
+        exit()
+
+    vqvae_model.eval() # Set to evaluation mode
+    vqvae_model.to(device) # Move VQVAE model to device
+
+    # Determine max_seq_len by processing one batch
+    print("Determining sequence length...")
+    max_seq_len = 0
+    quantized_shapes_ref = None
+    try:
+        # Get a sample batch
+        sample_batch = next(iter(dataloader))
+        # Check if data is a dictionary and has the 'image' key
+        if isinstance(sample_batch, dict) and 'image' in sample_batch:
+            sample_images = sample_batch["image"].to(device)
+        elif isinstance(sample_batch, torch.Tensor): # Handle cases where DataLoader might return only tensors
+            sample_images = sample_batch.to(device)
+        else:
+             raise TypeError(f"Unexpected data format from DataLoader: {type(sample_batch)}")
+
+        # Ensure images have 3 channels
+        if sample_images.shape[1] == 1:
+             sample_images = sample_images.repeat(1, 3, 1, 1)
+
+
+        with torch.no_grad():
+            wavelet_coeffs = get_wavelet_coeffs(sample_images)
+            total_indices_length = 0
+            quantized_shapes_ref = [] # Store reference shapes
+            for i in range(len(wavelet_coeffs)):
+                 encoded = vqvae_model.encoders[i](wavelet_coeffs[i])
+                 _, _, indices = vqvae_model.quantizers[i](encoded)
+                 total_indices_length += indices.shape[1] * indices.shape[2]
+                 quantized_shapes_ref.append(indices.shape) # Store (B, H_i, W_i)
+            max_seq_len = total_indices_length
+            print(f"Determined max sequence length: {max_seq_len}")
+            # Add buffer to max_seq_len just in case? Usually not needed if input size is fixed.
+            # max_seq_len += 10
+    except StopIteration:
+         print("Error: DataLoader yielded no batches. Check dataset and batch size.")
+         exit()
+    except Exception as e:
+        print(f"Error determining sequence length: {e}")
+        print("Check data loading, transformations, and VQ-VAE forward pass.")
+        exit()
+
+    if max_seq_len <= 1:
+        print(f"Error: Determined max_seq_len ({max_seq_len}) is too small. Cannot train transformer.")
+        exit()
+
+
+    # Initialize Transformer
+    print("Initializing Transformer model...")
+    transformer_model = WaveletTransformer(
+        num_embeddings=vqvae_num_embeddings, # Use the VQVAE codebook size
+        embedding_dim=vqvae_embedding_dim, # Transformer embedding dim must match VQVAE
+        num_heads=transformer_heads,
+        num_layers=transformer_layers,
+        hidden_dim=transformer_hidden_dim,
+        max_seq_len=max_seq_len + 1, # Add +1 buffer for positional encoding range
+        dropout=transformer_dropout
+    )
+    transformer_model.to(device) # Move transformer model to device
+
+    # --- Training Setup ---
+    optimizer = torch.optim.AdamW(transformer_model.parameters(), lr=transformer_lr)
+    # Use ignore_index=-100 if padding is introduced later, otherwise standard CE is fine
+    criterion = nn.CrossEntropyLoss()
+    log_dir = "runs/wavelet_transformer"
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard logs will be saved to: {log_dir}")
+
+    # --- Train the Transformer ---
+    trained_transformer, final_quantized_shapes = train_transformer(
+        transformer_model,
+        vqvae_model,
+        dataloader,
+        optimizer,
+        criterion,
+        transformer_epochs,
+        device,
+        writer,
+        max_seq_len # Pass the determined max length
+    )
+
+    # --- Save the Trained Transformer ---
+    transformer_save_path = "wavelet_transformer.pth"
+    print(f"Saving trained transformer model to {transformer_save_path}...")
+    torch.save(trained_transformer.state_dict(), transformer_save_path)
+    print("Model saved.")
+
+    # --- Calculate Reconstruction Loss (using generated samples) ---
+    # Use the reference shapes determined before training
+    calculate_reconstruction(
+        transformer_model=trained_transformer,
+        vqvae_model=vqvae_model,
+        quantized_shapes=quantized_shapes_ref, # Use shapes determined earlier
+        num_samples=16, # Number of samples to generate
+        max_gen_len=max_seq_len,
+        device=device,
+        start_token_idx=0 # Assuming 0 is a valid index
+    )
+
+    writer.close()
+    print("Finished.")
