@@ -4,7 +4,7 @@ This project explores a multiscale generative modeling approach combining discre
 
 ---
 
-## 📌 Project Overview
+## Project Overview
 
 Traditional generative models often struggle with maintaining fidelity at coarse scales. We propose a hybrid method that:
 
@@ -16,7 +16,7 @@ This results in faster training and multiresolution image generation capabilitie
 
 ---
 
-## 🛠️ Setup
+## Setup
 
 ### 1. Install Dependencies
 
@@ -30,7 +30,7 @@ You can use this command - git clone --branch standard-transformer https://githu
 
 ---
 
-## 🧪 Reproducing Results
+## Reproducing Results
 
 ### Step 1: Train Wavelet VQ-VAEs
 
@@ -78,7 +78,7 @@ python run_inference.py
 
 ---
 
-## 📊 Logging & Evaluation
+## Logging & Evaluation
 
 - TensorBoard logs are saved in `runs/`
 - Use `plot-loss.py` to visualize training curves
@@ -91,7 +91,7 @@ tensorboard --logdir=runs
 
 ---
 
-## 📁 Directory Structure
+## Directory Structure
 
 ```
 .
@@ -111,7 +111,7 @@ tensorboard --logdir=runs
 
 ---
 
-## 📦 Dataset
+## Dataset
 
 - [FFHQ-256](https://huggingface.co/datasets/merkol/ffhq-256) is used via 🤗 `datasets`
 
@@ -123,7 +123,7 @@ load_dataset("merkol/ffhq-256", split="train")
 
 ---
 
-## 🤝 Authors
+## Authors
 
 - Vikram Bhagavatula
 - Ritvika Sonawane
