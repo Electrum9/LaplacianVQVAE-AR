@@ -128,6 +128,3 @@ load_dataset("merkol/ffhq-256", split="train")
 - Vikram Bhagavatula
 - Ritvika Sonawane
 - Siddharth Shah
-
-Department of Electrical and Computer Engineering  
-Carnegie Mellon University
